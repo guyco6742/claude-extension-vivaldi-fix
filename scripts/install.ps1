@@ -62,6 +62,14 @@ $latest = $extRoots |
     Sort-Object { [version]($_.Name -replace '_\d+$','') } -Descending |
     Select-Object -First 1
 
+# Loading the patched copy (same extension ID) can make Vivaldi delete the Web Store
+# files, leaving an empty Extensions\<id> folder. Stop before deleting the destination.
+if (-not $latest -or -not (Test-Path (Join-Path $latest.FullName 'manifest.json'))) {
+    Write-Err2 "Claude extension folder found, but it has no installed version."
+    Write-Err2 "Remove 'Claude (Vivaldi-patched)', re-enable or reinstall Claude from the Chrome Web Store, then re-run."
+    exit 1
+}
+
 Write-Ok "Found: $($latest.FullName)"
 
 # --- 2. Confirm destination ---------------------------------------------------
@@ -153,8 +161,19 @@ $mod = [System.IO.File]::ReadAllText($modPath)
 $hits = ([regex]::Matches($mod, [regex]::Escape('new URLSearchParams(window.location.search)'))).Count
 if ($hits -eq 0) { Write-Err2 "location.search reads not found in sidepanel module; extension layout changed."; exit 1 }
 $mod = $mod.Replace('new URLSearchParams(window.location.search)', 'new URLSearchParams(window.__vivaldiSearch??window.location.search)')
-[System.IO.File]::WriteAllText($modPath, $mod, (New-Object System.Text.UTF8Encoding $false))
 Write-Ok "Redirected $hits location.search reads in the panel module"
+# Side panel detection: the panel treats chrome.tabs.getCurrent() === undefined as
+# "I am the side panel". Vivaldi returns the panel's own tab, so the panel shows
+# "Claude isn't available on this page". Also accept a top-level sidepanel.html
+# (framed copies are already handled by the window.top check that precedes it).
+$spRe = 'if\(void 0===(\w)\)return\{kind:"sidePanel"\}'
+if ([regex]::IsMatch($mod, $spRe)) {
+    $mod = [regex]::Replace($mod, $spRe, 'if(void 0===$1||location.pathname==="/sidepanel.html")return{kind:"sidePanel"}')
+    Write-Ok "Side panel detection no longer relies on tabs.getCurrent()"
+} else {
+    Write-Warn2 "Side panel detection check not found; skipped (older extension layout?)."
+}
+[System.IO.File]::WriteAllText($modPath, $mod, (New-Object System.Text.UTF8Encoding $false))
 [System.IO.File]::WriteAllText($htmlPath, $html, (New-Object System.Text.UTF8Encoding $false))
 Write-Ok "Added vivaldi-tabid.js loader"
 
@@ -167,8 +186,21 @@ Write-Step "Patching service worker sender check"
 $swPath = (Get-ChildItem (Join-Path $Destination 'assets') -Filter 'service-worker*.js' | Select-Object -First 1).FullName
 $sw = [System.IO.File]::ReadAllText($swPath)
 $re = 'return void 0===(\w)\.tab&&\1\.id===chrome\.runtime\.id\}'
-if (-not [regex]::IsMatch($sw, $re)) { Write-Err2 "sender check not found; extension layout changed."; exit 1 }
-$sw = [regex]::Replace($sw, $re, 'return $1.id===chrome.runtime.id&&($1.url||"").startsWith(chrome.runtime.getURL(""))}')
+# 1.0.109+: the check moved to a shared chunk and already verifies the sender URL:
+#   void 0===e.tab&&e.id===chrome.runtime.id&&"string"==typeof e.url&&e.url.startsWith(`chrome-extension://${chrome.runtime.id}/`)
+# Dropping only the tab condition leaves the same URL-based check as above.
+$reNew = 'void 0===(\w)\.tab&&(\1\.id===chrome\.runtime\.id&&"string"==typeof \1\.url&&\1\.url\.startsWith\()'
+if ([regex]::IsMatch($sw, $re)) {
+    $sw = [regex]::Replace($sw, $re, 'return $1.id===chrome.runtime.id&&($1.url||"").startsWith(chrome.runtime.getURL(""))}')
+} else {
+    $chunk = Get-ChildItem (Join-Path $Destination 'assets') -Filter '*.js' |
+        Where-Object { [regex]::IsMatch([System.IO.File]::ReadAllText($_.FullName), $reNew) } |
+        Select-Object -First 1
+    if (-not $chunk) { Write-Err2 "sender check not found; extension layout changed."; exit 1 }
+    $src = [regex]::Replace([System.IO.File]::ReadAllText($chunk.FullName), $reNew, '$2')
+    [System.IO.File]::WriteAllText($chunk.FullName, $src, (New-Object System.Text.UTF8Encoding $false))
+    Write-Ok "Sender check patched in $($chunk.Name)"
+}
 # Same for claude.ai framed in the panel (onMessageExternal): its sender.tab is the
 # panel's own tab, so trust it when that tab is sidepanel.html.
 $inPanel = '(void 0===$1.tab||($1.tab.url||"").startsWith(chrome.runtime.getURL("sidepanel.html")))'
@@ -180,13 +212,64 @@ foreach ($p in @(
     if ([regex]::IsMatch($sw, $p.re)) { $sw = [regex]::Replace($sw, $p.re, $p.to); $n++ }
 }
 if ($n -lt 2) { Write-Warn2 "Only $n/2 external sender checks patched; extension layout changed." }
+# The cowork bridge reads the panel's tabId from the sender URL. vivaldi-tabid.js
+# never changes the URL (it passes tabId through window.__vivaldiSearch), so the
+# bridge rejected every request ("panelTabId does not match the sending document")
+# and no tab group was created. Fall back to the tabId the panel sends; the sender
+# is already verified as an extension page above.
+$tidRe = 'const (\w+)=(\w+)\((\w)\.url\),(\w+)=(\w)\.panelTabId;'
+if ([regex]::IsMatch($sw, $tidRe)) {
+    $sw = [regex]::Replace($sw, $tidRe, 'const $1=$2($3.url)??$5.panelTabId,$4=$5.panelTabId;')
+    Write-Ok "Bridge accepts the panel's tabId when the URL has none"
+} else {
+    Write-Warn2 "Bridge tabId check not found; skipped."
+}
+# The panel replaces the bridge's error with a generic "anchor tab group not
+# established". Append the real reason so failures are diagnosable from the chat.
+$reasonOld = '{content:[{type:"text",text:"anchor tab group not established"}],is_error:!0});o=n.tabGroupId'
+if ($mod.Contains($reasonOld)) {
+    $mod = $mod.Replace($reasonOld, '{content:[{type:"text",text:"anchor tab group not established: "+(n.error||JSON.stringify(n))}],is_error:!0});o=n.tabGroupId')
+    [System.IO.File]::WriteAllText($modPath, $mod, (New-Object System.Text.UTF8Encoding $false))
+    Write-Ok "Panel shows the real bridge error"
+}
 # Surface the real cause instead of a generic message when the anchor group fails.
 $sw = $sw.Replace('catch(t){return{ok:!1,error:"anchor tab-group initialization failed"}}', 'catch(t){return{ok:!1,error:"anchor tab-group initialization failed: "+(t&&t.message||t)}}')
 
 [System.IO.File]::WriteAllText($swPath, $sw, (New-Object System.Text.UTF8Encoding $false))
 Write-Ok "Sender checks now URL-based"
 
-# --- 4d. Emulate tab groups ---------------------------------------------------
+# --- 4d. Silence two harmless warnings in the extension's error log ------------
+# Both come from the extension's own code (they also appear in Chrome); they don't
+# break anything, but they fill vivaldi://extensions -> Errors. Each tweak is
+# skipped with a warning if the code isn't found (minified names change per version).
+Write-Step "Silencing harmless extension warnings"
+$assetsDir = Join-Path $Destination 'assets'
+$tweaks = @(
+    # The silent keep-alive AudioContext is created before any user gesture, so it
+    # starts suspended anyway and Chrome logs "AudioContext was not allowed to start".
+    @{ what = 'AudioContext autoplay warning'
+       old  = 'try{if(!y){y=new AudioContext;'
+       new  = 'try{if(!y&&navigator.userActivation?.hasBeenActive){y=new AudioContext;' },
+    # debugger.detach callback ignores lastError -> "Unchecked runtime.lastError:
+    # Debugger is not attached to the tab". Reading it marks the error as handled.
+    @{ what = 'debugger.detach lastError'
+       old  = 'chrome.debugger.detach({tabId:t},()=>{e.clearPressNetwork(t),n(!0)})'
+       new  = 'chrome.debugger.detach({tabId:t},()=>{void chrome.runtime.lastError,e.clearPressNetwork(t),n(!0)})' }
+)
+foreach ($tw in $tweaks) {
+    $patched = $false
+    foreach ($jsFile in Get-ChildItem $assetsDir -Filter '*.js') {
+        $text = [System.IO.File]::ReadAllText($jsFile.FullName)
+        if ($text.Contains($tw.old)) {
+            [System.IO.File]::WriteAllText($jsFile.FullName, $text.Replace($tw.old, $tw.new), (New-Object System.Text.UTF8Encoding $false))
+            $patched = $true
+            break
+        }
+    }
+    if ($patched) { Write-Ok "Fixed: $($tw.what)" } else { Write-Warn2 "$($tw.what): code not found, skipped (harmless)." }
+}
+
+# --- 4e. Emulate tab groups ---------------------------------------------------
 # Vivaldi 8.3: chrome.tabs.group() returns an id but groups nothing, so every
 # browser tool fails with "anchor tab group not established". Load a shim that
 # emulates chrome.tabGroups before the service worker and the panel module.

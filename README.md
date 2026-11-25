@@ -96,6 +96,26 @@ In Vivaldi 8.3, `chrome.tabs.group()` returns a group id but groups nothing: `ta
 
 Tested on Windows 11 with Vivaldi 8.3.4191.44 and extension 1.0.100: chat, reading the page and opening links all work, including the permission prompt. `install.sh` does not apply these patches yet.
 
+### Extension 1.0.109
+
+Three more changes, checked by hand on Vivaldi (Windows 11) with extension 1.0.109, and again with a clean reinstall of `install.ps1`:
+
+- **Moved sender check.** The check now lives in a shared chunk (`ShortcutExecutionService-*.js`) and already verifies the sender URL. If the old pattern is missing, the script removes only its `tab` condition.
+- **"Claude isn't available on this page".** The panel treats `chrome.tabs.getCurrent() === undefined` as "I am the side panel". Vivaldi returns the panel's own tab, so the script also accepts a top-level `/sidepanel.html`.
+- **Bridge `tabId`.** The iframe bridge read `tabId` from the sender URL, which `vivaldi-tabid.js` never changes, so it rejected every request ("panelTabId does not match the sending document") and created no tab group. It now falls back to the `panelTabId` in the message.
+
+The panel also appends the real bridge error to "anchor tab group not established", so a failure shows its cause in the chat.
+
+Two harmless warnings that fill `vivaldi://extensions` → Errors are silenced too (each is skipped if its code isn't found):
+- `The AudioContext was not allowed to start`: the silent keep-alive context is now created only after a user gesture. Before that it was suspended and did nothing.
+- `Unchecked runtime.lastError: Debugger is not attached to the tab`: the `debugger.detach` callback now reads `lastError`.
+
+**Known limits**
+- The panel binds to the tab that is active when it opens. If a browser-internal page (`chrome://…`) is active, browser tools fail: open a normal page first, then open the panel.
+- After the extension fails once, start a **new chat** (the old one keeps the failed state), or reload the extension.
+- Loading the patched copy (same ID) can make Vivaldi delete the Web Store files. `install.ps1` then stops without touching your patched copy: reinstall Claude from the Web Store and re-run it.
+- The patched copy does not update itself. After a Web Store update, re-run `install.ps1 -Force`.
+
 ## Troubleshooting
 
 ### The patched extension won't load — "duplicate extension ID" error
